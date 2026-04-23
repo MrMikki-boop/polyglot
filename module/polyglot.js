@@ -7045,33 +7045,78 @@ Hooks.on("renderPolyglotGeneralSettings", renderPolyglotGeneralSettingsHandler);
 Hooks.on("renderChatMessageHTML", (message, html, _data) => {
 	const polyglot = game.polyglot;
 	if (!polyglot) return;
-
-	// Если у сообщения выставлен общий flags.polyglot.language,
-	// Polyglot сам обработает весь контент — не вмешиваемся.
 	if (message.getFlag("polyglot", "language")) return;
+	if (game.user.isGM && !game.settings.get("polyglot", "runifyGM")) return;
 
 	const spans = html.querySelectorAll("span.polyglot-journal");
 	if (!spans.length) return;
 
-	const isGM       = game.user.isGM;
-	const runifyGM   = game.settings.get("polyglot", "runifyGM");
-	const hideName   = game.settings.get("polyglot", "hideTranslation");
-
 	for (const span of spans) {
 		const lang = span.dataset.language;
 		if (!lang) continue;
-
-		// GM видит всё, если не включён runifyGM
-		if (isGM && !runifyGM) continue;
-
-		// Персонаж знает/понимает язык — оставляем как есть
 		if (polyglot.isLanguageknownOrUnderstood(lang)) continue;
 
-		// Шифруем текст и ставим шрифт выбранного языка
 		span.textContent = polyglot.scrambleString(span.textContent, message.id, lang);
-		span.style.font  = polyglot._getFontStyle(lang);
-
-		// Скрываем название языка от тех, кто его не знает
-		if (hideName) span.dataset.tooltip = "????";
+		span.style.font = polyglot._getFontStyle(lang);
 	}
+});
+
+Hooks.once("ready", () => {
+	const polyglot = game.polyglot;
+	if (!polyglot) return;
+
+	const isGMWithoutRunify = () =>
+		game.user.isGM && !game.settings.get("polyglot", "runifyGM");
+
+	function scrambleSpan(span) {
+		if (isGMWithoutRunify()) return;
+		if (span.closest("prose-mirror, .ProseMirror, [contenteditable='true']")) return;
+
+		const lang = span.dataset.language;
+		if (!lang) return;
+		if (polyglot.isLanguageknownOrUnderstood(lang)) return;
+		if (span.dataset.pgDone) return;
+
+		if (!span.dataset.pgOriginal) {
+			span.dataset.pgOriginal = span.textContent;
+		}
+
+		const salt = span.closest("[data-item-id]")?.dataset.itemId
+			?? span.closest("[data-message-id]")?.dataset.messageId
+			?? lang;
+
+		span.textContent = polyglot.scrambleString(span.dataset.pgOriginal, salt, lang);
+
+		const fontKey = polyglot.languageProvider.getLanguageFont(lang);
+		const font = polyglot.languageProvider.fonts[fontKey]
+			?? polyglot.languageProvider.fonts[polyglot.languageProvider.defaultFont];
+		if (font) {
+			span.style.setProperty("font-family", font.fontFamily, "important");
+			span.style.setProperty("font-size", font.fontSize + "%", "important");
+		}
+
+		span.dataset.pgDone = "1";
+	}
+
+	function processAll(root) {
+		if (!root?.querySelectorAll) return;
+		root.querySelectorAll("span.polyglot-journal").forEach(scrambleSpan);
+	}
+
+	processAll(document.body);
+
+	const observer = new MutationObserver((muts) => {
+		for (const m of muts) {
+			for (const node of m.addedNodes) {
+				if (node.nodeType !== 1) continue;
+				if (node.matches?.("prose-mirror")) continue;
+				if (node.closest?.("prose-mirror, .ProseMirror")) continue;
+
+				if (node.matches?.("span.polyglot-journal")) scrambleSpan(node);
+				else processAll(node);
+			}
+		}
+	});
+
+	observer.observe(document.body, { childList: true, subtree: true });
 });
