@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate package
+        shell: bash
+        run: |
+          node --check module/polyglot.js
+          node --check lib/tom-select/tom-select.complete.min.js
+
+          node <<'NODE'
+          const fs = require("fs");
+
+          const manifest = JSON.parse(fs.readFileSync("module.json", "utf8"));
+          const expectedTag = `v${manifest.version}`;
+          const isTagRun = process.env.GITHUB_REF_TYPE === "tag";
+          const currentTag = isTagRun ? process.env.GITHUB_REF_NAME : expectedTag;
+
+          if (!/^\d+\.\d+\.\d+$/.test(manifest.version)) {
+            throw new Error(`module.json version must be semver, got "${manifest.version}".`);
+          }
+
+          if (currentTag !== expectedTag) {
+            throw new Error(`Release tag "${currentTag}" does not match module.json version "${expectedTag}".`);
+          }
+
+          const expectedManifest = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/latest/download/module.json`;
+          const expectedDownload = `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/${expectedTag}/module.zip`;
+
+          if (manifest.manifest !== expectedManifest) {
+            throw new Error(`module.json manifest must be "${expectedManifest}", got "${manifest.manifest}".`);
+          }
+          if (manifest.download !== expectedDownload) {
+            throw new Error(`module.json download must be "${expectedDownload}", got "${manifest.download}".`);
+          }
+
+          const paths = [
+            ...(manifest.esmodules ?? []),
+            ...(manifest.scripts ?? []),
+            ...(manifest.styles ?? []),
+            ...(manifest.languages ?? []).map((language) => language.path),
+          ];
+
+          for (const entry of paths) {
+            if (!entry || !fs.existsSync(entry)) {
+              throw new Error(`Manifest path is missing: ${entry}`);
+            }
+          }
+
+          for (const language of manifest.languages ?? []) {
+            JSON.parse(fs.readFileSync(language.path, "utf8"));
+          }
+
+          fs.writeFileSync("release-tag.txt", `${expectedTag}\n`);
+          NODE
+
+      - name: Build release archive
+        shell: bash
+        run: |
+          rm -rf dist
+          mkdir -p dist/package
+
+          cp module.json dist/module.json
+          cp module.json dist/package/
+          cp -R fonts lang lib module styles templates dist/package/
+
+          find dist/package -name "*.map" -delete
+          find dist/package -type f \( -name "*.js" -o -name "*.css" \) -exec sed -i '/sourceMappingURL=/d' {} +
+
+          (
+            cd dist/package
+            zip -r ../module.zip module.json fonts lang lib module styles templates
+          )
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="$(cat release-tag.txt)"
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes "Release $TAG"
+          fi
+
+          gh release upload "$TAG" dist/module.json dist/module.zip --clobber

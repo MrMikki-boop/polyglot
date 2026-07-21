@@ -5749,12 +5749,14 @@ class PolyglotHooks {
 		if (actor.hasPlayerOwner && actor.testUserPermission(game.user, "OWNER")) {
 			game.polyglot.updateUserLanguages();
 			if (game.polyglot._enableChatFeatures) game.polyglot.updateChatMessages();
+			game.polyglot.updateRenderedPolyglotContent();
 		}
 	}
 
 	static controlToken() {
 		game.polyglot.updateUserLanguages();
 		if (game.polyglot._enableChatFeatures) game.polyglot.updateChatMessages();
+		game.polyglot.updateRenderedPolyglotContent();
 	}
 
 	/**
@@ -5827,7 +5829,12 @@ class PolyglotHooks {
 	 */
 	static async renderChatMessageHTML(message, html, data) {
 		const lang = message.getFlag("polyglot", "language");
-		if (!lang) return;
+		if (!lang) {
+			if (game.user.isGM && !game.settings.get("polyglot", "runifyGM")) return;
+			const messageContent = html.querySelector(".message-content") ?? html;
+			game.polyglot.scrambleJournalSpans(messageContent, message.id);
+			return;
+		}
 
 		if (game.polyglot.languageProvider.requiresReady && !game.ready) {
 			Hooks.once("polyglot.languageProvider.ready", async () => {
@@ -6102,6 +6109,7 @@ class Polyglot {
 		this.knownLanguages = new Set();
 		this.literateLanguages = new Set();
 		this.refreshTimeout = null;
+		this.contentRefreshTimeout = null;
 		this.FONTS = getFonts();
 		// TODO consider removing this variable and let LanguageProvider handle it instead
 		this.CustomFontSizes = game.settings.get("polyglot", "CustomFontSizes");
@@ -6276,6 +6284,57 @@ class Polyglot {
 			) {
 				ui.chat.updateMessage(message);
 			}
+		}
+	}
+
+	updateRenderedPolyglotContent() {
+		if (this.contentRefreshTimeout) clearTimeout(this.contentRefreshTimeout);
+		this.contentRefreshTimeout = setTimeout(this.updateRenderedPolyglotContentDelayed.bind(this), 250);
+	}
+
+	updateRenderedPolyglotContentDelayed() {
+		this.contentRefreshTimeout = null;
+		for (const app of this.getRenderedApplications()) {
+			const element = this.getApplicationElement(app);
+			if (!element?.querySelector?.("span.polyglot-journal")) continue;
+			if (this.isEditingApplicationElement(element)) continue;
+			this.renderApplication(app);
+		}
+	}
+
+	getRenderedApplications() {
+		const apps = new Set(Object.values(ui.windows ?? {}));
+		const instances = foundry.applications?.instances;
+		if (instances?.values) {
+			for (const app of instances.values()) apps.add(app);
+		} else if (instances) {
+			for (const app of Object.values(instances)) apps.add(app);
+		}
+		return apps;
+	}
+
+	getApplicationElement(app) {
+		const element = app?.element;
+		if (element instanceof HTMLElement) return element;
+		if (element?.[0] instanceof HTMLElement) return element[0];
+		return null;
+	}
+
+	isEditingApplicationElement(element) {
+		const activeElement = document.activeElement;
+		if (!activeElement || !element.contains(activeElement)) return false;
+		return Boolean(activeElement.closest("prose-mirror, .ProseMirror, [contenteditable='true']"));
+	}
+
+	renderApplication(app) {
+		try {
+			const render = app instanceof ApplicationV2 ? app.render({ force: true }) : app.render(true);
+			if (render instanceof Promise) render.catch((err) => {
+				console.error(`Polyglot | Failed to refresh "${app?.title ?? app?.id ?? "application"}".`, err);
+			});
+			return render;
+		} catch (err) {
+			console.error(`Polyglot | Failed to refresh "${app?.title ?? app?.id ?? "application"}".`, err);
 		}
 	}
 
@@ -6594,34 +6653,30 @@ class Polyglot {
 	scrambleSpans(document, html) {
 		// eslint-disable-next-line no-unused-vars
 		const [header, text, section] = html;
-		const spans = section ? section.querySelectorAll("span.polyglot-journal") : header.querySelectorAll("span.polyglot-journal");
-		spans.forEach((e) => {
-			const lang = e.dataset.language;
-			if (!lang) return;
-			const conditions = !game.polyglot._isTruespeech(lang)
-				&& !game.polyglot.isLanguageKnown(game.polyglot.comprehendLanguages)
-				&& !game.polyglot.languageProvider.conditions(lang);
-			if (conditions) {
-				e.dataset.tooltip = "????";
-				e.textContent = game.polyglot.scrambleString(e.textContent, document.id, lang);
-				e.style.font = game.polyglot._getFontStyle(lang);
-			}
-		});
+		this.scrambleJournalSpans(section ?? header, document.id);
 	}
 
 	scrambleSpansV2(document, html) {
-		html.querySelectorAll("span.polyglot-journal").forEach((e) => {
-			const lang = e.dataset.language;
-			if (!lang) return;
-			const conditions = !game.polyglot._isTruespeech(lang)
-				&& !game.polyglot.isLanguageKnown(game.polyglot.comprehendLanguages)
-				&& !game.polyglot.languageProvider.conditions(lang);
-			if (conditions) {
-				e.dataset.tooltip = "????";
-				e.textContent = game.polyglot.scrambleString(e.textContent, document.id, lang);
-				e.style.font = game.polyglot._getFontStyle(lang);
-			}
-		});
+		this.scrambleJournalSpans(html, document.id);
+	}
+
+	shouldScrambleJournalLanguage(lang) {
+		return !this._isTruespeech(lang)
+			&& !this.isLanguageKnown(this.comprehendLanguages)
+			&& !this.languageProvider.conditions(lang);
+	}
+
+	scrambleJournalSpan(span, salt) {
+		const lang = span.dataset.language;
+		if (!lang || !this.shouldScrambleJournalLanguage(lang)) return;
+		span.dataset.tooltip = this.languageProvider.languages?.[lang]?.label || lang;
+		span.textContent = this.scrambleString(span.textContent, salt, lang);
+		span.style.font = this._getFontStyle(lang);
+	}
+
+	scrambleJournalSpans(root, salt) {
+		if (!root?.querySelectorAll) return;
+		root.querySelectorAll("span.polyglot-journal").forEach((span) => this.scrambleJournalSpan(span, salt));
 	}
 
 	knows(lang) {
@@ -7041,82 +7096,3 @@ Hooks.on("ready", async () => {
 });
 Hooks.on("renderPolyglotGeneralSettings", renderPolyglotGeneralSettingsHandler);
 //# sourceMappingURL=polyglot.js.map
-
-Hooks.on("renderChatMessageHTML", (message, html, _data) => {
-	const polyglot = game.polyglot;
-	if (!polyglot) return;
-	if (message.getFlag("polyglot", "language")) return;
-	if (game.user.isGM && !game.settings.get("polyglot", "runifyGM")) return;
-
-	const spans = html.querySelectorAll("span.polyglot-journal");
-	if (!spans.length) return;
-
-	for (const span of spans) {
-		const lang = span.dataset.language;
-		if (!lang) continue;
-		if (polyglot.isLanguageknownOrUnderstood(lang)) continue;
-
-		span.textContent = polyglot.scrambleString(span.textContent, message.id, lang);
-		span.style.font = polyglot._getFontStyle(lang);
-	}
-});
-
-Hooks.once("ready", () => {
-	const polyglot = game.polyglot;
-	if (!polyglot) return;
-
-	const isGMWithoutRunify = () =>
-		game.user.isGM && !game.settings.get("polyglot", "runifyGM");
-
-	function scrambleSpan(span) {
-		if (isGMWithoutRunify()) return;
-		if (span.closest("prose-mirror, .ProseMirror, [contenteditable='true']")) return;
-
-		const lang = span.dataset.language;
-		if (!lang) return;
-		if (polyglot.isLanguageknownOrUnderstood(lang)) return;
-		if (span.dataset.pgDone) return;
-
-		if (!span.dataset.pgOriginal) {
-			span.dataset.pgOriginal = span.textContent;
-		}
-
-		const salt = span.closest("[data-item-id]")?.dataset.itemId
-			?? span.closest("[data-message-id]")?.dataset.messageId
-			?? lang;
-
-		span.textContent = polyglot.scrambleString(span.dataset.pgOriginal, salt, lang);
-
-		const fontKey = polyglot.languageProvider.getLanguageFont(lang);
-		const font = polyglot.languageProvider.fonts[fontKey]
-			?? polyglot.languageProvider.fonts[polyglot.languageProvider.defaultFont];
-		if (font) {
-			span.style.setProperty("font-family", font.fontFamily, "important");
-			span.style.setProperty("font-size", font.fontSize + "%", "important");
-		}
-
-		span.dataset.pgDone = "1";
-	}
-
-	function processAll(root) {
-		if (!root?.querySelectorAll) return;
-		root.querySelectorAll("span.polyglot-journal").forEach(scrambleSpan);
-	}
-
-	processAll(document.body);
-
-	const observer = new MutationObserver((muts) => {
-		for (const m of muts) {
-			for (const node of m.addedNodes) {
-				if (node.nodeType !== 1) continue;
-				if (node.matches?.("prose-mirror")) continue;
-				if (node.closest?.("prose-mirror, .ProseMirror")) continue;
-
-				if (node.matches?.("span.polyglot-journal")) scrambleSpan(node);
-				else processAll(node);
-			}
-		}
-	});
-
-	observer.observe(document.body, { childList: true, subtree: true });
-});
