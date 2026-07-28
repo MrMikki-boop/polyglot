@@ -5945,10 +5945,10 @@ class PolyglotHooks {
 			else game.polyglot.scrambleSpans(sheet, html);
 		} else if (isJQuery && html.find(".polyglot-journal").length) {
 			if (isOwnerOrGM && html.find('[data-engine="prosemirror"]').length) game.polyglot.insertHeaderButton(sheet, html);
-			else if (!(isOwnerOrGM || isEditable)) game.polyglot.scrambleSpans(sheet, html);
+			game.polyglot.scrambleSpans(sheet, html, { skipEditable: true });
 		} else if (!isJQuery && html.querySelectorAll(".polyglot-journal").length) {
 			if (isOwnerOrGM && html.querySelectorAll('[data-engine="prosemirror"]').length) game.polyglot.insertHeaderButton(sheet, html);
-			else if (!(isOwnerOrGM || isEditable)) game.polyglot.scrambleSpansV2(sheet, html);
+			game.polyglot.scrambleSpansV2(sheet, html, { skipEditable: true });
 		}
 	}
 
@@ -6110,7 +6110,9 @@ class Polyglot {
 		this.literateLanguages = new Set();
 		this.refreshTimeout = null;
 		this.contentRefreshTimeout = null;
+		this.richTooltipWrapperRegistered = false;
 		this.FONTS = getFonts();
+		this.canvasFallbackFontFamily = this.getCanvasFallbackFontFamily();
 		// TODO consider removing this variable and let LanguageProvider handle it instead
 		this.CustomFontSizes = game.settings.get("polyglot", "CustomFontSizes");
 		CONFIG.fontDefinitions = foundry.utils.mergeObject(CONFIG.fontDefinitions, this.FONTS);
@@ -6140,6 +6142,9 @@ class Polyglot {
 		Hooks.on("renderStorySheet", PolyglotHooks.renderJournalSheet);
 		Hooks.on("renderJournalEntryPageSheet", PolyglotHooks.renderDocumentSheet);
 		Hooks.on("getProseMirrorMenuDropDowns", PolyglotHooks.getProseMirrorMenuDropDowns);
+		Hooks.on("drawToken", (token) => this.sanitizeTokenTextFonts(token));
+		Hooks.on("refreshToken", (token) => this.sanitizeTokenTextFonts(token));
+		Hooks.once("ready", () => this.registerDnd5eItemTooltipWrapper());
 		Polyglot.handleTinyMCE();
 
 		libWrapper.register(
@@ -6192,6 +6197,27 @@ class Polyglot {
 			},
 			"WRAPPER",
 		);
+	}
+
+	registerDnd5eItemTooltipWrapper() {
+		if (this.richTooltipWrapperRegistered || game.system.id !== "dnd5e") return;
+		const target = globalThis.dnd5e?.documents?.Item5e?.prototype?.richTooltip
+			? "dnd5e.documents.Item5e.prototype.richTooltip"
+			: CONFIG.Item.documentClass?.prototype?.richTooltip
+				? "CONFIG.Item.documentClass.prototype.richTooltip"
+				: "";
+		if (!target) return;
+		const polyglot = this;
+		libWrapper.register(
+			"polyglot",
+			target,
+			async function (wrapped, ...args) {
+				const tooltip = await wrapped(...args);
+				return polyglot.scrambleRichTooltip(tooltip, this?.uuid);
+			},
+			"WRAPPER",
+		);
+		this.richTooltipWrapperRegistered = true;
 	}
 
 	get chatElement() {
@@ -6335,6 +6361,30 @@ class Polyglot {
 			return render;
 		} catch (err) {
 			console.error(`Polyglot | Failed to refresh "${app?.title ?? app?.id ?? "application"}".`, err);
+		}
+	}
+
+	getCanvasFallbackFontFamily() {
+		const current = CONFIG.canvasTextStyle?.fontFamily;
+		if (current && !this.isPolyglotFontFamily(current)) return current;
+		return "Signika";
+	}
+
+	isPolyglotFontFamily(fontFamily) {
+		const families = Array.isArray(fontFamily) ? fontFamily : [fontFamily];
+		return families.some((family) => this.FONTS[family]);
+	}
+
+	sanitizeTokenTextFonts(token) {
+		if (!token?.children?.length) return;
+		const stack = [...token.children];
+		while (stack.length) {
+			const child = stack.pop();
+			if (child?.children?.length) stack.push(...child.children);
+			const style = child?.style;
+			if (!style || !this.isPolyglotFontFamily(style.fontFamily)) continue;
+			style.fontFamily = this.canvasFallbackFontFamily;
+			child.dirty = true;
 		}
 	}
 
@@ -6650,14 +6700,14 @@ class Polyglot {
 	 * @param {Document} document
 	 * @param {HTMLElement} html
 	 */
-	scrambleSpans(document, html) {
+	scrambleSpans(document, html, options = {}) {
 		// eslint-disable-next-line no-unused-vars
 		const [header, text, section] = html;
-		this.scrambleJournalSpans(section ?? header, document.id);
+		this.scrambleJournalSpans(section ?? header, document.id, options);
 	}
 
-	scrambleSpansV2(document, html) {
-		this.scrambleJournalSpans(html, document.id);
+	scrambleSpansV2(document, html, options = {}) {
+		this.scrambleJournalSpans(html, document.id, options);
 	}
 
 	shouldScrambleJournalLanguage(lang) {
@@ -6674,9 +6724,26 @@ class Polyglot {
 		span.style.font = this._getFontStyle(lang);
 	}
 
-	scrambleJournalSpans(root, salt) {
+	scrambleRichTooltip(tooltip, salt) {
+		if (!tooltip?.content || typeof tooltip.content !== "string" || !tooltip.content.includes("polyglot-journal")) {
+			return tooltip;
+		}
+		const wrapper = document.createElement("div");
+		wrapper.innerHTML = tooltip.content;
+		this.scrambleJournalSpans(wrapper, salt);
+		return { ...tooltip, content: wrapper.innerHTML };
+	}
+
+	isEditableJournalSpan(span) {
+		return Boolean(span.closest("prose-mirror, .ProseMirror, [contenteditable='true'], [data-engine='prosemirror']"));
+	}
+
+	scrambleJournalSpans(root, salt, { skipEditable = false } = {}) {
 		if (!root?.querySelectorAll) return;
-		root.querySelectorAll("span.polyglot-journal").forEach((span) => this.scrambleJournalSpan(span, salt));
+		root.querySelectorAll("span.polyglot-journal").forEach((span) => {
+			if (skipEditable && this.isEditableJournalSpan(span)) return;
+			this.scrambleJournalSpan(span, salt);
+		});
 	}
 
 	knows(lang) {
